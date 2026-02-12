@@ -226,41 +226,52 @@ function tryPort(email, mxServer, port, timeout) {
   });
 }
 
-function verifyWithSMTP(email, mxServer, timeout = 10000) {
-  const ports = [25, 587, 465]; // Try in order
+function verifyWithSMTP(email, mxServer, timeout = 5000) {
+  const ports = [25, 587, 465];
 
-  return new Promise(async (resolve) => {
-    let lastError = null;
-    let allPortsBlocked = true;
+  return new Promise((mainResolve) => {
+    let pending = ports.length;
+    let resolved = false;
+    const results = [];
 
-    for (const port of ports) {
-      const result = await tryPort(email, mxServer, port, timeout);
+    ports.forEach((port) => {
+      tryPort(email, mxServer, port, timeout).then((result) => {
+        if (resolved) return;
 
-      if (result.success) {
-        // Success on any port
-        resolve({
-          ...result,
-          allPortsBlocked: false,
-        });
-        return;
-      }
+        results.push(result);
+        pending--;
 
-      // Store error for fallback
-      lastError = result;
+        // 1. Success (Valid email)
+        if (result.success) {
+          resolved = true;
+          mainResolve({ ...result, allPortsBlocked: false });
+          return;
+        }
 
-      // Check if port gave a definitive answer (not a timeout)
-      if (result.responseCode > 0 && result.responseCode < 600) {
-        allPortsBlocked = false;
-      }
-    }
+        // 2. Definitive Failure (User doesn't exist, rejected)
+        // 5xx codes are permanent errors.
+        if (result.responseCode >= 550 && result.responseCode < 600) {
+          resolved = true;
+          mainResolve({ ...result, allPortsBlocked: false });
+          return;
+        }
 
-    // All ports failed
-    resolve({
-      success: false,
-      responseCode: 0,
-      message: "All SMTP ports blocked",
-      allPortsBlocked: true,
-      lastError: lastError,
+        // 3. If all finished
+        if (pending === 0) {
+          // Find the "best" result.
+          // If we have any response code > 0, that's better than a timeout (0).
+          const bestResult =
+            results.find((r) => r.responseCode > 0) || results[0];
+          const allBlocked = results.every((r) => r.responseCode === 0); // 0 is timeout/error
+
+          mainResolve({
+            ...bestResult,
+            allPortsBlocked: allBlocked,
+            message: allBlocked ? "All SMTP ports blocked" : bestResult.message,
+            lastError: bestResult, // Return logic expects this sometimes
+          });
+        }
+      });
     });
   });
 }
@@ -318,8 +329,8 @@ async function verifyEmail(email, options = {}) {
   const {
     checkMX = true,
     checkSMTP = true,
-    timeout = 10000,
-    maxAttempts = 3,
+    timeout = 2500,
+    maxAttempts = 2,
   } = options;
 
   const result = {
@@ -338,6 +349,11 @@ async function verifyEmail(email, options = {}) {
     verificationMethod: "unknown", // NEW: Which method was used
     disposable: false, // NEW: Whether the domain is disposable
     roleBased: false, // NEW: Whether the account is role-based
+    steps: {
+      syntax: { valid: false, message: "Pending" },
+      mx: { valid: null, message: "Skipped" },
+      smtp: { valid: null, message: "Skipped" },
+    },
   };
 
   try {
@@ -349,9 +365,11 @@ async function verifyEmail(email, options = {}) {
       result.subresult = "invalid_syntax";
       result.error = syntaxValidation.error;
       result.verificationMethod = "syntax_validation";
+      result.steps.syntax = { valid: false, message: syntaxValidation.error };
       result.executiontime = Math.round((Date.now() - startTime) / 1000);
       return result;
     }
+    result.steps.syntax = { valid: true, message: "Format is valid" };
 
     const [localPart, domain] = email.trim().split("@");
     result.domain = domain;
@@ -380,16 +398,22 @@ async function verifyEmail(email, options = {}) {
           result.subresult = "no_mx_records";
           result.error = "No MX records found for domain";
           result.verificationMethod = "dns_lookup";
+          result.steps.mx = { valid: false, message: "No MX records found" };
           result.executiontime = Math.round((Date.now() - startTime) / 1000);
           return result;
         }
         result.mxRecords = mxRecords;
+        result.steps.mx = {
+          valid: true,
+          message: `Found ${mxRecords.length} MX records`,
+        };
       } catch (error) {
         result.result = "unknown";
         result.resultcode = 3;
         result.subresult = "dns_lookup_failed";
         result.error = error.message;
         result.verificationMethod = "dns_lookup";
+        result.steps.mx = { valid: false, message: error.message };
         result.executiontime = Math.round((Date.now() - startTime) / 1000);
         return result;
       }
@@ -443,6 +467,7 @@ async function verifyEmail(email, options = {}) {
       if (smtpSuccess) {
         result.result = "valid";
         result.resultcode = 1;
+        result.steps.smtp = { valid: true, message: "Mailbox exists" };
       } else if (smtpBlocked) {
         // SMTP is blocked, but previous checks passed
         // Use DNS validation as fallback
@@ -452,15 +477,31 @@ async function verifyEmail(email, options = {}) {
         result.verificationMethod = "dns_lookup_fallback";
         result.error =
           "SMTP ports blocked (all ports timeout) - Verified via DNS MX records";
+        result.steps.smtp = {
+          valid: null,
+          message: "Blocked/Timeout (Fallback to DNS)",
+        };
       } else if (lastResponseCode >= 450 && lastResponseCode < 500) {
         result.result = "unknown";
         result.resultcode = 3;
+        result.steps.smtp = {
+          valid: false,
+          message: `Greylisted/Throttled (${lastResponseCode})`,
+        };
       } else if (lastResponseCode >= 550 && lastResponseCode < 600) {
         result.result = "invalid";
         result.resultcode = 6;
+        result.steps.smtp = {
+          valid: false,
+          message: `Mailbox not found / Rejected (${lastResponseCode})`,
+        };
       } else {
         result.result = "unknown";
         result.resultcode = 3;
+        result.steps.smtp = {
+          valid: false,
+          message: `Unknown response (${lastResponseCode})`,
+        };
       }
 
       if (!smtpSuccess && lastMessage) {
@@ -472,6 +513,7 @@ async function verifyEmail(email, options = {}) {
       result.subresult = "syntax_and_mx_valid";
       result.smtpChecked = false;
       result.verificationMethod = "dns_lookup";
+      result.steps.smtp = { valid: null, message: "Skipped by config" };
     }
 
     result.executiontime = Math.round((Date.now() - startTime) / 1000);
