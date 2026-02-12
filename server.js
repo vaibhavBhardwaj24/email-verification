@@ -2,7 +2,7 @@ const http = require("http");
 const url = require("url");
 const { verifyEmail } = require("./emailVerifier");
 
-let port = 3000;
+let port = process.env.PORT || 3000;
 
 const createServer = () => {
   const server = http.createServer(async (req, res) => {
