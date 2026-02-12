@@ -408,8 +408,8 @@ async function verifyEmail(email, options = {}) {
           message: `Found ${mxRecords.length} MX records`,
         };
       } catch (error) {
-        result.result = "unknown";
-        result.resultcode = 3;
+        result.result = "invalid";
+        result.resultcode = 6;
         result.subresult = "dns_lookup_failed";
         result.error = error.message;
         result.verificationMethod = "dns_lookup";
